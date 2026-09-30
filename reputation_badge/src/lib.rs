@@ -17,6 +17,9 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_wit
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod bench;
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]

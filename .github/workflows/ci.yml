@@ -259,6 +259,57 @@ jobs:
       - name: Build wasm
         run: cargo build --target wasm32-unknown-unknown --release --locked
 
+  resource-budget:
+    name: Resource budget (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
+    #
+    # Per-job audit (all trigger types, checked 2026-09-30):
+    #   resource-budget — checkout, cargo test --features testutils bench → contents: read  ✓
+    #
+    # What this job enforces (issue #149):
+    #   Each `bench_*` test in `src/bench.rs` calls the entrypoint from a
+    #   worst-case fixture (max batch size, max list sizes, max bond) then
+    #   asserts that `Budget::cpu_instruction_cost()` and
+    #   `Budget::memory_bytes_cost()` do not exceed the published ceilings.
+    #   A ceiling breach fails the test and blocks the PR.
+    #
+    # Ceiling values are floor(measured × 1.10 / 1_000) × 1_000.  Update them
+    # by running `cargo test --features testutils bench -- --nocapture` locally
+    # and reading the `CEILING_HINT` lines.  See docs/149-*.md for details.
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [intent_settlement, solver_registry, proof_registry, reputation_badge]
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+          key: resource-budget
+
+      - name: Run resource-budget ceiling assertions
+        # --features testutils is required by the bench harness.
+        # -- --nocapture prints the CEILING_HINT lines, useful for updating
+        #    ceilings after a deliberate change or SDK bump.
+        run: cargo test --features testutils bench -- --nocapture
+
+      - name: Summarise ceiling results
+        if: always()
+        shell: bash
+        run: |
+          echo "### Resource-budget ceilings (${{ matrix.crate }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run \`cargo test --features testutils bench -- --nocapture\` locally to see per-entrypoint measurements and CEILING_HINT lines." >> "$GITHUB_STEP_SUMMARY"
+          echo "See docs/149-intent-settlement.md and docs/149-satellite-contracts.md for the reference tables." >> "$GITHUB_STEP_SUMMARY"
+
   proptest:
     name: Bond-conservation proptest
     runs-on: ubuntu-latest
