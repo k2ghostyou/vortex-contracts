@@ -121,6 +121,21 @@ const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 /// Minimum solver bond amount in stroops (50 USDC). Overridable via set_config().
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC
 
+/// Minimum delay between `propose_rescue` and `execute_rescue`.  Matches
+/// `ADMIN_TIMELOCK_DELAY` so the community has the same 48-hour window to
+/// notice and react to a pending rescue as to any other admin-key action.
+/// A rescue proposal also emits a `rescue_proposed` event immediately so
+/// off-chain monitors have advance notice.
+const RESCUE_TIMELOCK_DELAY: u64 = ADMIN_TIMELOCK_DELAY; // 48 hours
+
+// ── Defaults seeded into `ProtocolConfig` by `initialize`, and the fallback
+// `load_config` returns for contracts deployed before the configurable-params
+// feature existed.  They mirror the historical compile-time constants above.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
 /// Protocol fee in basis points (issue #36). Overridable via set_config().
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 
@@ -535,6 +550,13 @@ pub enum DataKey {
     /// touches this key, so proof-gating is fully opt-in and defaults off
     /// exactly like `DstAllowlistEnabled`.
     ProofRegistry,
+
+    /// **Persistent storage.** Pending `propose_rescue` record for `token`:
+    /// stores the target address, the amount, the ledger timestamp at which
+    /// `execute_rescue` may apply it, and the ledger sequence at which the
+    /// proposal was created (for the same-ledger conflict guard).
+    /// Cleared by `execute_rescue` or a future `cancel_rescue` call.
+    PendingRescue(Address),
 
     /// **Instance storage.** Per-token running liability counter (`i128`) for
     /// all protocol obligations in `token` NOT already covered by `TotalBonded`
@@ -974,6 +996,33 @@ pub struct ReputationSnapshot {
     pub total_volume: i128,
 }
 
+/// A pending `propose_rescue` record.  Stored under
+/// `DataKey::PendingRescue(token)` in persistent storage.  Consumed (and
+/// removed) by `execute_rescue`.
+///
+/// The `proposed_ledger` field carries the Soroban ledger sequence number at
+/// the time the proposal was made, so `execute_rescue` can enforce the
+/// same-ledger conflict guard — if the execution lands in the same ledger
+/// (sequence) as the proposal there has been no intervening block and the
+/// `TokenLiabilities` snapshot taken at proposal time may already be stale.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingRescueRecord {
+    /// The token the rescue will transfer.
+    pub token: Address,
+    /// Recipient of the rescued funds.
+    pub to: Address,
+    /// Amount to transfer (must be ≤ `balance − liabilities` at both proposal
+    /// and execution time).
+    pub amount: i128,
+    /// Ledger timestamp at which `execute_rescue` becomes callable.
+    pub eta: u64,
+    /// Soroban ledger sequence at which the proposal was created, used by the
+    /// same-ledger conflict guard to prevent a proposal and its execution
+    /// from landing in the same block.
+    pub proposed_ledger: u32,
+}
+
 /// Issue #363: Solver operator key with scoped permissions
 #[contracttype]
 #[derive(Clone)]
@@ -1321,6 +1370,36 @@ pub enum Error {
     IntentNotAcceptedForFill = 85,
     /// `accept_intent` called for a bond token not on the allowed list.
     BondTokenNotAllowed = 86,
+
+    // ── Rescue timelock errors (issue #265 replacement) ──────────────────────
+
+    /// `execute_rescue` was called before the `RESCUE_TIMELOCK_DELAY` since
+    /// the matching `propose_rescue` call has elapsed.  Mirrors the pattern
+    /// used for `TimelockNotElapsed` on admin-transfer and dst-token changes.
+    RescueTimelockNotElapsed = 87,
+
+    /// `execute_rescue` (or `cancel_rescue`) was called with no matching
+    /// `PendingRescue` record for the given token in persistent storage.
+    /// Either `propose_rescue` was never called for this token, or the
+    /// previous rescue was already executed or cancelled.
+    NoPendingRescue = 88,
+
+    /// `execute_rescue` or `propose_rescue` was called in the same ledger
+    /// as a liability-changing operation on the same token.  The per-token
+    /// `TokenLiabilities` counter cannot be atomically snapshotted across
+    /// ledger boundaries within a single transaction, so same-ledger
+    /// proposals/executions are rejected to prevent a race where a bond
+    /// deposit and a rescue land in the same ledger, giving the rescue a
+    /// stale surplus view.
+    RescueLiabilityConflict = 89,
+
+    /// `execute_rescue` was called but the contract's current balance in
+    /// `token` minus `TokenLiabilities(token)` is less than the requested
+    /// `amount`.  The surplus available for rescue has shrunk since
+    /// `propose_rescue` (e.g. a new bond was posted or an escrow was
+    /// created in the interim), so the rescue is rejected rather than
+    /// drawing on funds needed by the protocol.
+    RescueAmountExceedsSurplus = 90,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -2268,6 +2347,10 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalBonded, &(total_bonded + bond_amount));
 
+        // Increment per-token liabilities so `compute_token_liabilities` stays
+        // accurate for the rescue-surplus check.
+        Self::adjust_token_liabilities(&env, &bond_token, bond_amount);
+
         if is_new_solver {
             let total: u32 = env
                 .storage()
@@ -2366,6 +2449,9 @@ impl IntentSettlement {
         let mut total_default_refund = 0i128;
         for i in 0..refunds.len() {
             let (t, amt) = refunds.get(i).unwrap();
+            // Decrement per-token liabilities before the transfer so the
+            // surplus view is always conservative (never over-counts available).
+            Self::adjust_token_liabilities(&env, &t, -amt);
             token::Client::new(&env, &t).transfer(
                 &env.current_contract_address(),
                 &solver,
