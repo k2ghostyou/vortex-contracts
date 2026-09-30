@@ -5,6 +5,7 @@ members = [
   "solver_registry",
   "proof_registry",
   "reputation_badge",
+  "directory",
 ]
 resolver = "2"
 
