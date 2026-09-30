@@ -6,6 +6,7 @@ members = [
   "proof_registry",
   "reputation_badge",
   "directory",
+  "treasury_streams",
 ]
 resolver = "2"
 
