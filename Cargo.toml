@@ -8,6 +8,7 @@ members = [
   "directory",
   "treasury_streams",
   "fee_router",
+  "arbiter_panel",
 ]
 resolver = "2"
 
