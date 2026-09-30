@@ -64,6 +64,9 @@ pub const PROOF_VALIDITY_WINDOW: u64 = 3600;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod bench;
+
 // ─── Wormhole Core boundary ──────────────────────────────────────────────────
 
 /// The decoded, signature-verified VAA envelope returned by the Wormhole Core
